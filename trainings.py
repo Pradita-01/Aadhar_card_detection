@@ -2,81 +2,101 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms, datasets
+from torchvision import datasets
 from transformers import CLIPProcessor, CLIPModel
 from tqdm import tqdm
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 import matplotlib.pyplot as plt
-from PIL import Image  # To load a single image for prediction
-
 
 # Paths and settings
 train_dir = "dataset/train"
 val_dir = "dataset/validation"
-batch_size = 4
-img_size = 224
+batch_size = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f" Using device: {device}")
 
-
-# Data transforms
-transform = transforms.Compose([
-    transforms.Resize((img_size, img_size)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
-
-# Datasets and loaders
-train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
-val_dataset = datasets.ImageFolder(root=val_dir, transform=transform)
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-class_names = train_dataset.classes
-print(f"Classes: {class_names}")
-
-
-# Load pretrained CLIP model
+# Load pretrained CLIP
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# Freeze CLIP weights
+# Freeze all CLIP layers first (then we can unfreeze later for fine-tuning)
 for param in clip_model.parameters():
     param.requires_grad = False
 
+# Custom classifier head
 embed_dim = clip_model.config.projection_dim
-
-# Define custom classifier head
 classifier = nn.Sequential(
     nn.Linear(embed_dim, 256),
     nn.ReLU(),
-    nn.Dropout(0.3),
-    nn.Linear(256, len(class_names))  # Automatically handle number of classes
+    nn.Dropout(0.4),
+    nn.Linear(256, 2)  # 2 classes: real, fake
 ).to(device)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(classifier.parameters(), lr=1e-4)
+# Dataset using CLIP preprocessing
+class CLIPDataset(torch.utils.data.Dataset):
+    def __init__(self, root_dir, processor):
+        self.dataset = datasets.ImageFolder(root=root_dir)
+        self.processor = processor
 
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        image = self.processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
+        return image, label
+
+train_dataset = CLIPDataset(train_dir, clip_processor)
+val_dataset = CLIPDataset(val_dir, clip_processor)
+
+# Fix class imbalance
+labels = [label for _, label in train_dataset.dataset.samples]
+class_counts = torch.bincount(torch.tensor(labels))
+class_weights = 1. / class_counts.float()
+sample_weights = [class_weights[label] for label in labels]
+sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights))
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+print(f" Class weights: {class_weights}")
+
+# Focal Loss to handle imbalance
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
+
+criterion = FocalLoss()
+optimizer = optim.AdamW(classifier.parameters(), lr=2e-4)
 
 # Training loop
-epochs = 10
+epochs = 15
+best_val_acc = 0
+
 for epoch in range(epochs):
     classifier.train()
-    running_loss = 0.0
-    correct, total = 0, 0
+    running_loss, correct, total = 0.0, 0, 0
 
-    for images, labels in tqdm(train_loader, desc=f" Epoch {epoch+1}/{epochs}"):
+    for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
         images, labels = images.to(device), labels.to(device)
 
-        # Extract image features with CLIP
-        with torch.no_grad():
+        with torch.no_grad():  # Freeze CLIP encoder during this phase
             image_features = clip_model.get_image_features(pixel_values=images)
 
-        # Forward pass through classifier
         outputs = classifier(image_features)
         loss = criterion(outputs, labels)
 
-        # Backpropagation
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -86,76 +106,49 @@ for epoch in range(epochs):
         correct += (predicted == labels).sum().item()
         total += labels.size(0)
 
-    avg_loss = running_loss / len(train_loader)
     train_acc = 100 * correct / total
-    print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Train Accuracy: {train_acc:.2f}%")
+    print(f" Epoch [{epoch+1}/{epochs}], Loss: {running_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}%")
 
-
-# Validation accuracy
-classifier.eval()
-correct, total = 0, 0
-with torch.no_grad():
-    for images, labels in val_loader:
-        images, labels = images.to(device), labels.to(device)
-
-        image_features = clip_model.get_image_features(pixel_values=images)
-        outputs = classifier(image_features)
-        _, predicted = torch.max(outputs, 1)
-
-        correct += (predicted == labels).sum().item()
-        total += labels.size(0)
-
-val_acc = 100 * correct / total
-print(f" Validation Accuracy: {val_acc:.2f}%")
-
-
-# 🔥 Function: Predict a single image (real/fake)
-def predict_image(image_path):
+    # Validation
     classifier.eval()
-    try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        print(f" Could not open image: {e}")
-        return
-
-    transformed = transform(image).unsqueeze(0).to(device)  # Add batch dimension
+    val_correct, val_total = 0, 0
+    all_preds, all_labels = [], []
 
     with torch.no_grad():
-        image_features = clip_model.get_image_features(pixel_values=transformed)
-        outputs = classifier(image_features)
-        _, predicted = torch.max(outputs, 1)
-        predicted_class = class_names[predicted.item()]
-        print(f"The image is predicted as: **{predicted_class}**")
-
-
-# 🔥 Function: Show predictions for validation data
-def show_predictions(loader, num_images=6):
-    classifier.eval()
-    images_shown = 0
-    plt.figure(figsize=(15, 5))
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
             image_features = clip_model.get_image_features(pixel_values=images)
             outputs = classifier(image_features)
             _, predicted = torch.max(outputs, 1)
 
-            for i in range(images.size(0)):
-                if images_shown >= num_images:
-                    break
-                img = images[i].permute(1, 2, 0).cpu().numpy()
-                pred_label = class_names[predicted[i]]
-                plt.subplot(1, num_images, images_shown + 1)
-                plt.imshow((img * 0.5) + 0.5)  # Unnormalize
-                plt.title(f"Pred: {pred_label}")
-                plt.axis('off')
-                images_shown += 1
-    plt.show()
+            val_correct += (predicted == labels).sum().item()
+            val_total += labels.size(0)
 
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
-# Example usage: Predict a single image
-test_image_path = r"test_images/sample.png"  # Replace with your own image path
-predict_image(test_image_path)
+    val_acc = 100 * val_correct / val_total
+    print(f" Validation Acc: {val_acc:.2f}%")
 
-# 🚀 Example usage: Show predictions for validation set
-show_predictions(val_loader)
+    # Save best model
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save({
+            'clip_model_state_dict': clip_model.state_dict(),
+            'classifier_state_dict': classifier.state_dict()
+        }, "best_model.pth")
+        print(" Best model saved!")
+
+# Classification report
+print("\n Final Classification Report:")
+print(classification_report(all_labels, all_preds, target_names=train_dataset.dataset.classes))
+
+# Confusion matrix
+cm = confusion_matrix(all_labels, all_preds)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=train_dataset.dataset.classes,
+            yticklabels=train_dataset.dataset.classes)
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.show()
